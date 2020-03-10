@@ -6,19 +6,41 @@ from subprocess import Popen, PIPE
 import argparse
 import random
 import numpy as np
+import ast
+import pickle
 
 # we can seed the oscillation counts based on the client username
 # we will always have 16 oscillators, the server will save the oscillation
 # counts and predict the result
 
-def read_puf(name):
-    random.seed(name)
+def encrypt(plaintext):
+    # need single quotes to avoid expansion in bash
+    command = f"echo -n '{plaintext}' | "
+    command += f"openssl rsautl -encrypt -pubin -inkey server_pub.pem | "
+    command += r"xxd -u -p | tr -d '\n'"
+    stream = os.popen(command)
+    cyphertext = stream.read()
+    return cyphertext
+
+def decrypt(name, cyphertext):
+    # need single quotes to avoid expansion in bash
+    command = f"echo -n '{cyphertext}' | "
+    command += "xxd -r -p | "
+    command += f"openssl rsautl -decrypt -inkey {name}_pri.pem"
+    stream = os.popen(command)
+    plaintext = stream.read()
+    return plaintext
+
+def read_puf(puf_seed):
+    random.seed(puf_seed)
     averages = [random.randint(500, 2000) for i in range(16)]
+    print(f"puf_averages = {averages}")
     result = []
     for i in range(16):
         # the averages are seeded but the sample is not
         # this simulates the randomness of each PUF
-        sample = np.random.normal(averages[i], 50, 1)[0]
+        # std is 15 here, is this reasonable?
+        sample = np.random.normal(averages[i], 15, 1)[0]
         sample = int(sample)
         result.append(sample)
     return result
@@ -35,22 +57,47 @@ def readLine(sock, recv_buffer = 1024, delim='\n'):
             return line
     return
 
-def send_to_server(tcp_socket, name, message):
-    tcp_socket.sendall(message.encode())
+def send_to_server(tcp_socket, message, name, do_encrypt):
+    print(f"sending to server: {message.strip()}")
+    if(do_encrypt):
+        message = encrypt(message)
+    tcp_socket.sendall((message + "\n").encode())
     response = readLine(tcp_socket)
-    print(f"received from server: {response}")
+    if(do_encrypt):
+        response = decrypt(name, response)
+    print(f"received from server: {response}\n")
     return response
   
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="The client PUF communicator")
     parser.add_argument("server_host", type=str,
                         help="The ip address (or hostname) of the server")
+    parser.add_argument("port", type=int,
+                        help="server tcp port to connect to")
+    parser.add_argument("--encrypt", dest="encrypt", action="store_true",
+                        help="set this option to encrypt all traffic")
     args = parser.parse_args()
     
     name = input("Username: ")
-    print(f"name = {name}")
     if(name.find("'") != -1 or name.find("\"") != -1):
         raise Exception("Quotes are not allowed in usernames!")
+    new_puf = input("Do you want to create a new PUF?(yes/no): ")
+    new_puf = new_puf.lower()
+    puf_seed = None
+    if(new_puf == "yes"):
+        puf_seed = random.randint(0, 1000000)
+        with open(f"{name}.puf", "wb") as f:
+            pickle.dump(str(puf_seed), f)
+    else:
+        if(not os.path.exists(f"{name}.puf")):
+            print("PUF not found for user, creating one")
+            puf_seed = random.randint(0, 1000000)
+            with open(f"{name}.puf", "wb") as f:
+                pickle.dump(puf_seed, f)
+        else:
+            with open(f"{name}.puf", "rb") as f:
+                puf_seed = int(pickle.load(f))
+    print(f"puf_seed = {puf_seed}")
     if(os.path.exists(f"{name}_pri.pem") and
        os.path.exists(f"{name}_pub.pem")):
         # user has their key files in the current directory, continue
@@ -66,6 +113,7 @@ if __name__ == "__main__":
             command += "openssl rsa -in \"${prefix}_pri.pem\" -outform "
             command += "PEM -pubout -out \"${prefix}_pub.pem\""
             stream = os.popen(command)
+            stream.read()
             if(os.path.exists(f"{name}_pri.pem") and
                os.path.exists(f"{name}_pub.pem")):
                 print("Key file generation success")
@@ -85,13 +133,13 @@ if __name__ == "__main__":
     host_ip = gethostbyname(args.server_host)
     print("Server IP: " + str(host_ip))
 
-    tcp_port = "45819"
+    tcp_port = str(args.port)
 
     # Check if we have a valid port
 
     tcp_socket = socket(AF_INET, SOCK_STREAM)
     # display the server's TCP Port number
-    print("Server TCP Port: " + str(tcp_port))
+    # print("Server TCP Port: " + str(tcp_port))
     
     # open a TCP connection to the server.
     try:
@@ -103,27 +151,44 @@ if __name__ == "__main__":
 
     try:
         user_entry = input("Actions: 1. Query Server For Secret, 2. Exit\nChoice(1/2): ")
+        print()
         if(user_entry == '1'):
             response = send_to_server(tcp_socket,
+                                      f"{name}: get secret",
                                       name,
-                                      f"{name}: get secret\n")
-            print(f"response = {response}")
-            if(response == f"{name} is not enrolled, send oscillation counts"):
+                                      args.encrypt)
+            if(response == f"{name} is not enrolled, send oscillation list"):
                 # send oscillation counts
-                oscillations = read_puf(name)
+                oscillations = read_puf(puf_seed)
                 response = send_to_server(tcp_socket,
+                                          str(oscillations),
                                           name,
-                                          str(oscillations) + "\n")
+                                          args.encrypt)
                 if(response == "please reconnect"):
-                    print("you have been enrolled, reconnect")
                     tcp_socket.close()
                     exit(0)
                 else:
-                    print("enrollment failure, please retry")
+                    raise Exception("Server side error")
                     tcp_socket.close()
                     exit(0)
             else:
-                pass
+                # user is enrolled, string should be a challenge
+                challenge = response[response.find(':')+2:]
+                challenge = ast.literal_eval(challenge)
+                puf_reading = read_puf(puf_seed)
+                bit_string = ""
+                for pair in challenge:
+                    index1 = pair[0]
+                    index2 = pair[1]
+                    print(f"puf({index1}) cmp puf({index2}) -- {puf_reading[index1]} cmp {puf_reading[index2]}")
+                    if(puf_reading[index1] >= puf_reading[index2]):
+                        bit_string += "1"
+                    else:
+                        bit_string += "0"
+                response = send_to_server(tcp_socket,
+                                          f"{bit_string}",
+                                          name,
+                                          args.encrypt)
         elif(user_entry == '2'):
             print("Good Bye.")
             tcp_socket.close()
